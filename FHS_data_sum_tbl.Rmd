@@ -86,22 +86,28 @@ NA_df <- data.frame('Column_Name' = names(NA_tally),
 
 NA_df <- NA_df[order(NA_df$Missing_Proportion, decreasing=T), ]
 rownames(NA_df) <- NULL
-View(NA_df)
-
 
 NA_df %>%
   kbl(caption = "Table S1: Missingness by Column") %>%
   kable_classic(full_width = F, html_font = "Cambria")
 
 
+
+
 # filter by variables that have 5% missing or less
 v_names_use <- names(NA_tally)[NA_tally < 0.05]
 v_names_use <- v_names_use[-1]
+
+# seeing the proportion of complete cases
+sum(complete.cases(fhs_most_recent))/nrow(fhs_most_recent) # 50% missingness
 ```
 
 ## Comparing Groups
 ```{r}
 fhs_most_recent_red <- fhs_most_recent[,(colnames(fhs_most_recent) %in% v_names_use)]
+
+sum(complete.cases(fhs_most_recent_red))/nrow(fhs_most_recent_red) # 96% complete
+
 # res <- compareGroups(DEATH~., data=fhs_most_recent_red)
 # restab <- createTable(res, hide.no = "no")
 # export2md(restab, caption = 'Table 1: Summary Statistics by Death Status', html_font = 'Cambria') %>% kable_classic(html_font = "Cambria")
