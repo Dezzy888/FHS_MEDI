@@ -96,9 +96,20 @@ fhs_most_recent_red <- fhs_most_recent[,(colnames(fhs_most_recent) %in% v_names_
 
 fhs_imp <- mice(fhs_most_recent_red,m=5,maxit=50,meth='rf',seed=500)
 
+# collecting the five imputed datasets
 fhs_imp1 <- complete(fhs_imp, 1)
+fhs_imp2 <- complete(fhs_imp, 2)
+fhs_imp3 <- complete(fhs_imp, 3)
+fhs_imp4 <- complete(fhs_imp, 4)
+fhs_imp5 <- complete(fhs_imp, 5)
+
+# collecting imputed datasets into a list
+imp_list <- list(fhs_imp1, fhs_imp2, fhs_imp3, fhs_imp4, fhs_imp5)
+
 anyNA(fhs_imp1) # no missing
 ```
+
+## Rudimenatry Exploration
 
 ### Heatmap
 ```{r}
@@ -111,7 +122,7 @@ corrplot(m)
 ggpairs(fhs_imp1[,c('SYSBP', 'DIABP', 'HEARTRTE', 'educ', 'CIGPDAY', 'AGE', 'BMI')])
 ```
 
-## Variable Distributions by Class
+### Variable Distributions by Class
 ```{r}
 fhs_imp1_trans <- fhs_imp1 %>%
   mutate(across(everything(), as.numeric)) %>%   # force all predictors to numeric
@@ -123,29 +134,38 @@ fhs_imp1_trans <- fhs_imp1 %>%
 
 fhs_imp1_trans$DEATH <- as.factor(fhs_imp1_trans$DEATH)
 
-# ggplot(fhs_imp1_trans, aes(x = value, fill = DEATH)) +
-#   geom_density(alpha = 0.4) +
-#   facet_wrap(~ variable, scales = "free", ncol = 4) +
-#   labs(title='Variable Distributions by Death')
-#   theme_bw()
+ggplot(fhs_imp1_trans, aes(x = value, fill = DEATH)) +
+  geom_density(alpha = 0.4) +
+  facet_wrap(~ variable, scales = "free", ncol = 4) +
+  labs(title='Variable Distributions by Death')
+  theme_bw()
 ```
 
 ## Train-Test Split
 ```{r}
-prop.table(table(fhs_imp1$DEATH))
 library(splitTools)
 
-set.seed(123)
-inds <- partition(fhs_imp1$DEATH, p = c(train = 0.80, test = 0.20)) # 80% train-test split
-train <- fhs_imp1[inds$train, ]
-test <- fhs_imp1[inds$test, ]
+for (i in 1:length(imp_list)) {
+  
+  # setting the seed for the train-test split
+  seed_init <- 123 + i - 1
+  set.seed(seed_init)
+  inds_init <- partition(imp_list[[i]]$DEATH, p = c(train = 0.80, test = 0.20))
+  
+  # label the train test split using inds
+  imp_list[[i]]$label <- NA
+  imp_list[[i]]$label[inds_init$train] <- 'train'
+  imp_list[[i]]$label[inds_init$test] <- 'test'
+  
+  # export as CSV
+  file_name <- paste('fhs_imp_', i, '_pyth.csv', sep='')
+  write.csv(imp_list[[i]], file_name, row.names = FALSE)
+  
+}
 
-# exporting a labeled dataset for use in python
-fhs_imp1_export <- fhs_imp1
-fhs_imp1_export$label <- NA
-fhs_imp1_export$label[inds$train] <- 'train'
-fhs_imp1_export$label[inds$test] <- 'test'
-write.csv(fhs_imp1_export, 'fhs_imp1_pyth.csv', row.names = FALSE)
+train <- fhs_imp1[imp_list[[1]]$label == 'train', ]
+test <- fhs_imp1[imp_list[[1]]$label == 'test', ]
+
 ```
 
 ## Function for summarizing the statistics
@@ -250,17 +270,17 @@ set.seed(123)
 model.null <- glm(DEATH ~ 1, family = 'binomial', data = train)
 step.model.forward <- step(model.null, direction = "forward", scope = list(lower = model.null, upper = lr1), trace=0)
 (s_forward <- summary(step.model.forward))
-nrow(s_forward$coefficients) # 19 variables
+nrow(s_forward$coefficients) 
 
 step.model.backward <- step(lr1, direction = "backward", trace=0)
 (s_backward <- summary(step.model.backward))
-nrow(s_backward$coefficients) # 19 variables
+nrow(s_backward$coefficients) 
 
 step.model.both <- step(lr1, direction = "both", trace=0)
 (s_both <- summary(step.model.both))
-nrow(s_both$coefficients) # 19 variables
+nrow(s_both$coefficients) 
 
-nrow(s_full$coefficients) # 23 variables
+nrow(s_full$coefficients) 
 ```
 
 ### Alternative logisitic regression model selection: LASSO
@@ -304,7 +324,6 @@ intersect(step.model.both_vnames, lso.res.vnames)
 setdiff(step.model.both_vnames, lso.res.vnames) # PREVMI in step model
 setdiff(lso.res.vnames, step.model.both_vnames) # PREVCHD, PREVSTRK, CVDin lso model
 ```
-
 
 
 ### Comparing Models
@@ -368,8 +387,6 @@ threshold_coords_lr <- coords(roc_obj_lr, "best", best.method = "closest.topleft
 
 predicted_classes_lr <- ifelse(probs_final_lr >= best_threshold_lr, 1, 0)
 confusionMatrix(factor(predicted_classes_lr), factor(test$DEATH))
-
-exp(summary(step.model.both)$coefficients)
 ```
 
 ### Logistic Regression with High SHAP Values
