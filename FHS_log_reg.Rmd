@@ -2,6 +2,8 @@
 title: "FHS_logisitic_regression + Sensitivity Analysis"
 output: html_document
 date: "2025-09-18"
+editor_options: 
+  chunk_output_type: console
 ---
 
 # Setup
@@ -184,7 +186,7 @@ for (i in 1:length(comp_df_collection_train)) {
 
 for (i in 1:length(comp_df_collection_test)) {
    View(comp_df_collection_test[[i]], title = paste(c('Test Results for imputed dataset', i), collapse=' '))
-  write.csv(comp_df_collection_train[[i]], file = paste(c('test_lr_res_imp', i, '.csv'), collapse=''), row.names = F)
+  write.csv(comp_df_collection_test[[i]], file = paste(c('test_lr_res_imp', i, '.csv'), collapse=''), row.names = F)
 }
 
 # Checking if the selected variables differ between the both and backwards models in each case
@@ -233,3 +235,21 @@ for (i in 1: length(model_collection_list)) {
 
 ```
 
+# Printing Model Summary for the Initial Dataset
+```{r}
+imp1_lr <- summary(model_collection_list[[1]]$Both)$coefficients
+imp1_lr <- as.data.frame(imp1_lr)
+imp1_lr$sig <- ifelse(imp1_lr$`Pr(>|z|)` < 0.05, '**', '-')
+imp1_lr
+imp1_lr$`z value` <- NULL
+imp1_lr$`Pr(>|z|)` <- NULL
+imp1_lr$`Std. Error` <- NULL
+rownames(imp1_lr) <- gsub("[0-9]", "", rownames(imp1_lr))
+
+imp1_lr <- cbind(imp1_lr, confint(model_collection_list[[1]]$Both))
+imp1_lr <- imp1_lr[,c(1,3,4,2)]
+
+imp1_lr[1:3] <- apply(imp1_lr[1:3], MARGIN = 2, function(x){round(exp(x), 3)})
+
+View(imp1_lr)
+```
