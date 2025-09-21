@@ -1,0 +1,2 @@
+Model NAame,AUC,Threshold,Accuracy,Sensitivity,Specificity
+XGboost,0.797,0.414,0.764,0.652,0.825
