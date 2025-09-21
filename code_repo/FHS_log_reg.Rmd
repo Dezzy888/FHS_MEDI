@@ -1,0 +1,255 @@
+---
+title: "FHS_logisitic_regression + Sensitivity Analysis"
+output: html_document
+date: "2025-09-18"
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+```{r}
+
+# Importing Libraries
+library(tidyr)
+library(plyr)
+library(dplyr)
+library(glmnet)
+library(MASS)
+library(mice)
+library(VIM)
+library(caret)
+library(pROC)
+
+# Importing Datasets
+fhs_imp1 <- read.csv('fhs_imp_1_pyth.csv')
+fhs_imp2 <- read.csv('fhs_imp_2_pyth.csv')
+fhs_imp3 <- read.csv('fhs_imp_3_pyth.csv')
+fhs_imp4 <- read.csv('fhs_imp_4_pyth.csv')
+fhs_imp5 <- read.csv('fhs_imp_5_pyth.csv')
+```
+
+
+# Helper functions for model output
+```{r}
+## Returns the variable names for an inputted model
+get_vnames <- function(model) {
+  if (class(model)[1]=='cv.glmnet') {
+    lso.res <- coef(model, s = 'lambda.1se')[,1]
+    vnames <- names(lso.res[lso.res!=0]) 
+  } else {
+    vnames <- names(coef(model))
+  }
+  vnames <- gsub("[0-9]", "", vnames)
+  vnames <- vnames[vnames!='(Intercept)']
+  
+  return (vnames)
+}
+
+## Outputs the model summary for the best threshold
+### model summary includes: AUC, best_threshold, accuracy, sensitivity, specificity
+model_tuned_sum <- function(model, dataset) {
+  
+  # Output model probabilities for each observation
+  
+  ## if LASSO, center and scale the data
+  
+  if (class(model)[1] == 'cv.glmnet') {
+    xxx <- as.matrix(dataset[,colnames(dataset)!='DEATH'])
+    num_cols <- which(unlist(lapply(dataset[,colnames(dataset)!='DEATH'], class)) != 'factor')
+    num_cols_idx <- unname(num_cols)
+
+    xxx_centered_scaled <- xxx
+    xxx_centered_scaled[, num_cols_idx] <- apply(xxx[,num_cols_idx], 2,
+                                                        function(x){x <- as.numeric(x)
+        (x - mean(x)) / sd(x)})
+    new_data <- xxx_centered_scaled
+    probs <- predict(model, type = 'response', newx = new_data, s =  'lambda.1se')
+  } else {
+    probs <- predict(model, type = 'response', newdata = dataset)
+  }
+  
+  roc_obj <- roc(dataset$DEATH, probs)
+  auc_obj <- auc(roc_obj)
+  
+  # Identify threshold maximizing sensitivity and specificity
+  coords <- coords(roc_obj, "best", best.method = "closest.topleft")
+  best_threshold <- coords$threshold
+  
+  # Predict classes based on optimal threshold
+  predicted_class <- ifelse(probs >= best_threshold, 1, 0)
+  c_mat <- table(preds = predicted_class, real = dataset$DEATH)
+  tn <- c_mat[1,1]
+  fp <- c_mat[2,1]
+  fn <- c_mat[1,2]
+  tp <- c_mat[2,2]
+  
+  # Evaluate model performance
+  specificity <- tn / (tn+fp)
+  sensitivity <- tp / (tp + fn)
+  acc <- (tp + tn) / (tn + fp + fn + tp)
+  
+  output <- list(auc_obj, best_threshold, acc, sensitivity, specificity)
+  output <- lapply(output, function(x){round(x,3)})
+  names(output) <- c('AUC', 'Threshold', 'Accuracy', 'Sensitivity', 'Specificity')
+  
+  return (output)
+}
+
+## Compares the inputted models
+model_comp <- function(model_list, dataset) {
+  
+  res_list <- lapply(model_list, function(x){unlist(model_tuned_sum(x, dataset))})
+  res_df <- as.data.frame(do.call(rbind, res_list))
+  res_df$Variable_Names <- unlist(lapply(model_list, function(x){paste(get_vnames(x), collapse=',')}))
+  res_df$Number_of_Features <- unlist(lapply(model_list, function(x){length(get_vnames(x))}))
+  rownames(res_df) <- names(model_list)
+  
+  # outputting dataframe
+  return (res_df)
+}
+
+```
+
+# Repeat analysis: Logistic Regression
+
+## Finding the best model for the training set using AUC
+```{r}
+# collection of imputed datasets
+imp_list <- list(fhs_imp1, fhs_imp2, fhs_imp3, fhs_imp4, fhs_imp5)
+model_collection_list <- vector(mode = 'list', length = 5)
+comp_df_collection_train <- vector(mode = 'list', length = 5)
+comp_df_collection_test <- vector(mode = 'list', length = 5)
+
+## BEGIN LOOP
+for (i in 1:length(comp_df_collection)) {
+  
+  # making factor variables
+  imp_list[[i]] <- imp_list[[i]] %>%
+    mutate(across(
+      where(~ n_distinct(.) == 2), 
+      as.factor
+    ))
+  
+  # train-test split
+  train <- imp_list[[i]][imp_list[[i]]$label == 'train', ]
+  train$label <- NULL
+  test <- imp_list[[i]][imp_list[[i]]$label == 'test', ]
+  test$label <- NULL
+  
+  # training
+  
+  ## full model
+  lr1 <- glm(DEATH ~., family = 'binomial', data = train)
+  
+  ## null model
+  model.null <- glm(DEATH ~ 1, family = 'binomial', data = train)
+  
+  ## stepwise selected models
+  step.model.forward <- step(model.null, direction = "forward", scope = list(lower = model.null, upper = lr1), trace=0)
+  step.model.backward <- step(lr1, direction = "backward", trace=0)
+  step.model.both <- step(lr1, direction = "both", trace=0)
+  
+  # LASSO model
+  set.seed(123)
+  xxx <- as.matrix(train[,colnames(train)!='DEATH'])
+  num_cols <- which(unlist(lapply(train[,colnames(train)!='DEATH'], class)) != 'factor')
+  num_cols_idx <- unname(num_cols)
+  
+  xxx_centered_scaled <- xxx
+  
+  xxx_centered_scaled[, num_cols_idx] <- apply(xxx[,num_cols_idx], 2,
+                                                          function(x){x <- as.numeric(x)
+          (x - mean(x)) / sd(x)})
+  yyy <- train$DEATH
+  gridd <- exp(seq(2, -10, -0.5))
+  
+  cv.lso <- cv.glmnet(xxx,yyy,family="binomial",alpha=1,lambda=gridd,nfolds=10,type.measure="auc")
+  
+  # model comparison
+  model_collection <- list(lr1, step.model.forward, step.model.backward, step.model.both, cv.lso)
+  names(model_collection) <- c('Full', 'Forward', 'Backward', 'Both', 'LASSO')
+  comp_df <- model_comp(model_collection, train)
+  
+  # keeping the models
+  comp_df_collection_train[[i]] <- comp_df
+  model_collection_list[[i]] <- model_collection
+  
+  # model_comparison on the test datset
+  comp_df_collection_test[[i]] <- model_comp(model_collection, test)
+}
+
+# Viewing results for which logistic regression models to use in anova
+for (i in 1:length(comp_df_collection_train)) {
+  View(comp_df_collection_train[[i]], title = paste(c('Train Results for imputed dataset', i), collapse=' '))
+  write.csv(comp_df_collection_train[[i]], file = paste(c('train_lr_res_imp', i, '.csv'), collapse=''), row.names = F)
+}
+
+for (i in 1:length(comp_df_collection_test)) {
+   View(comp_df_collection_test[[i]], title = paste(c('Test Results for imputed dataset', i), collapse=' '))
+  write.csv(comp_df_collection_test[[i]], file = paste(c('test_lr_res_imp', i, '.csv'), collapse=''), row.names = F)
+}
+
+# Checking if the selected variables differ between the both and backwards models in each case
+for (i in 1:length(comp_df_collection)) {
+  
+  back_lr <- comp_df_collection_train[[i]]$Variable_Names[rownames(comp_df_collection[[i]]) == 'Backward']
+  back_lr <- sort(unlist(lapply(back_lr, strsplit, split = ',')))
+  
+  both_lr <- comp_df_collection_train[[i]]$Variable_Names[rownames(comp_df_collection[[i]]) == 'Both']
+  both_lr <- sort(unlist(lapply(back_lr, strsplit, split = ',')))
+  
+  print(identical(back_lr, both_lr))
+}
+
+# Notice that in all cases, both or backward vs full was the best option
+# Backward vs both produce the same variables
+# For future analysis, we will use the "Both" model
+```
+
+## Analysis of Variance Comparisons between the Full Model and the Both Model
+```{r}
+for (i in 1: length(model_collection_list)) {
+  
+  imp_list[[i]] <- imp_list[[i]] %>%
+    mutate(across(
+      where(~ n_distinct(.) == 2), 
+      as.factor
+    ))
+
+  train <- imp_list[[i]][imp_list[[i]]$label == 'train', ]
+  
+  full_v <- comp_df_collection[[i]]$Variable_Names[rownames(comp_df_collection[[i]]) == 'Full']
+  full_v <- sort(unlist(lapply(back_lr, strsplit, split = ',')))
+  
+  both_v <- comp_df_collection[[i]]$Variable_Names[rownames(comp_df_collection[[i]]) == 'Both']
+  both_v <- sort(unlist(lapply(back_lr, strsplit, split = ',')))
+  
+  fmla_full <- paste(c('DEATH', paste(full_v, collapse='+')), collapse='~')
+  full_model <- glm(as.formula(fmla_full), family = 'binomial', data = train)
+  
+  fmla_both <- paste(c('DEATH', paste(both_v, collapse='+')), collapse='~')
+  both_model <- glm(as.formula(fmla_both), family = 'binomial', data = train)
+  
+  print(anova(full_model, both_model))
+}
+
+```
+
+# Model Summary for the First Imputed Dataset
+```{r}
+imp1_lr <- summary(model_collection_list[[1]]$Both)$coefficients
+imp1_lr <- as.data.frame(imp1_lr)
+imp1_lr$sig <- ifelse(imp1_lr$`Pr(>|z|)` < 0.05, '**', '-')
+imp1_lr
+imp1_lr$`z value` <- NULL
+imp1_lr$`Pr(>|z|)` <- NULL
+imp1_lr$`Std. Error` <- NULL
+rownames(imp1_lr) <- gsub("[0-9]", "", rownames(imp1_lr))
+
+imp1_lr <- cbind(imp1_lr, confint(model_collection_list[[1]]$Both))
+imp1_lr <- imp1_lr[,c(1,3,4,2)]
+
+imp1_lr[1:3] <- apply(imp1_lr[1:3], MARGIN = 2, function(x){round(exp(x), 3)})
+
+View(imp1_lr)
+```

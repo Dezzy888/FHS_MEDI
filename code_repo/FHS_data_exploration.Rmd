@@ -1,0 +1,534 @@
+---
+title: "FHS_data_exploration"
+output: html_document
+date: "2025-09-01"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+```{r}
+library(tidyr)
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(mice)
+library(glmnet)
+library(class)
+library(MASS)
+library(factoextra)
+library(mice)
+library(VIM)
+library(caret)
+library(pROC)
+library(Hmisc)
+library(corrplot)
+library(GGally)
+fhs_data <- read.csv('fhs_data.csv')
+```
+
+## Exploring repeat data
+```{r}
+colnames(fhs_data)
+
+## counting the number of subjects
+rand_ids <- plyr::count(fhs_data$RANDID)
+rand_ids$subject_number <- 1:nrow(rand_ids)
+
+## Plotting it
+# plot(rand_ids$subject_number, rand_ids$freq)
+
+## showing how many subjects have more than 1 observation
+(tbl_counts <- table(rand_ids$freq)) # 3206 subjects have 3 observations
+(tbl_counts_prop <- tbl_counts / sum(tbl_counts)) # 72.3% have 3 observations
+
+## counting the number of subjects we have in the dataset
+length(unique(fhs_data$RANDID)) # 4434 subjects total
+
+## reordering the dataset
+fhs_data <- fhs_data[order(fhs_data$RANDID),]
+# View(head(fhs_data[fhs_data$DEATH==1,]))
+```
+
+## Data-preprocessing
+
+### Data filtering by most recent
+```{r}
+fhs_most_recent <- fhs_data %>%
+  group_by(RANDID) %>%
+  filter(PERIOD == max(PERIOD)) %>%
+  ungroup()
+
+nrow(fhs_most_recent)
+
+fhs_most_recent <- fhs_most_recent[,c('RANDID','AGE','SEX','SYSBP','DIABP','TOTCHOL','HDLC','LDLC','GLUCOSE','CURSMOKE','CIGPDAY','HEARTRTE', 'educ', 'PREVCHD', 'PREVAP', 'PREVMI','PREVSTRK', 'PREVHYP', 'ANGINA', 'HOSPMI', 'MI_FCHD', 'STROKE', 'CVD', 'ANYCHD', 'HYPERTEN', 'BMI','DIABETES','BPMEDS','DEATH')]
+
+# transforming binary variables into factors
+fhs_most_recent <- fhs_most_recent %>%
+  mutate(across(
+    where(~ n_distinct(.) == 2), 
+    as.factor
+  ))
+```
+
+### Managing missing values
+
+#### Tallying up the missing values in each column
+```{r}
+NA_tally <- unlist(lapply(fhs_most_recent, function(x){sum(is.na(x))/length(x)}))
+NA_df <- data.frame(v_name = names(NA_tally),
+                    missing_proportion = unname(NA_tally))
+# View(NA_df)
+
+# filter by variables that have 5% missing or less
+v_names_use <- names(NA_tally)[NA_tally < 0.05]
+v_names_use <- v_names_use[-1]
+```
+
+#### Checking the dataset
+```{r}
+
+fhs_most_recent_red <- fhs_most_recent[,(colnames(fhs_most_recent) %in% v_names_use)]
+
+fhs_imp <- mice(fhs_most_recent_red,m=5,maxit=50,meth='rf',seed=500)
+
+# collecting the five imputed datasets
+fhs_imp1 <- complete(fhs_imp, 1)
+fhs_imp2 <- complete(fhs_imp, 2)
+fhs_imp3 <- complete(fhs_imp, 3)
+fhs_imp4 <- complete(fhs_imp, 4)
+fhs_imp5 <- complete(fhs_imp, 5)
+
+# collecting imputed datasets into a list
+imp_list <- list(fhs_imp1, fhs_imp2, fhs_imp3, fhs_imp4, fhs_imp5)
+
+anyNA(fhs_imp1) # no missing
+```
+
+## Rudimenatry Exploration
+
+### Heatmap
+```{r}
+m <- cor(fhs_imp1, use = "pairwise.complete.obs")  # correlation matrix
+corrplot(m)
+```
+
+### Variable Distributions
+```{r}
+ggpairs(fhs_imp1[,c('SYSBP', 'DIABP', 'HEARTRTE', 'educ', 'CIGPDAY', 'AGE', 'BMI')])
+```
+
+### Variable Distributions by Class
+```{r}
+fhs_imp1_trans <- fhs_imp1 %>%
+  mutate(across(everything(), as.numeric)) %>%   # force all predictors to numeric
+  pivot_longer(
+    cols = -DEATH,
+    names_to = "variable",
+    values_to = "value"
+  )
+
+fhs_imp1_trans$DEATH <- as.factor(fhs_imp1_trans$DEATH)
+
+ggplot(fhs_imp1_trans, aes(x = value, fill = DEATH)) +
+  geom_density(alpha = 0.4) +
+  facet_wrap(~ variable, scales = "free", ncol = 4) +
+  labs(title='Variable Distributions by Death')
+  theme_bw()
+```
+
+## Train-Test Split
+```{r}
+library(splitTools)
+
+for (i in 1:length(imp_list)) {
+  
+  # setting the seed for the train-test split
+  seed_init <- 123 + i - 1
+  set.seed(seed_init)
+  inds_init <- partition(imp_list[[i]]$DEATH, p = c(train = 0.80, test = 0.20))
+  
+  # label the train test split using inds
+  imp_list[[i]]$label <- NA
+  imp_list[[i]]$label[inds_init$train] <- 'train'
+  imp_list[[i]]$label[inds_init$test] <- 'test'
+  
+  # export as CSV
+  file_name <- paste('fhs_imp_', i, '_pyth.csv', sep='')
+  write.csv(imp_list[[i]], file_name, row.names = FALSE)
+  
+}
+
+train <- fhs_imp1[imp_list[[1]]$label == 'train', ]
+test <- fhs_imp1[imp_list[[1]]$label == 'test', ]
+
+```
+
+## Function for summarizing the statistics
+```{r}
+model_sum <- function(model, dataset) {
+  probs <- predict(model, type = 'response')
+  pred_class <- ifelse(probs>=0.5,1,0)
+  mean(pred_class==dataset$DEATH)
+  table(preds = pred_class, real = dataset$DEATH)
+  
+  roc_obj <- roc(dataset$DEATH, probs)
+  cat('AUC_ROC', auc(roc_obj), '\n')
+  cat('Confusion Matrix without Tuning:\n')
+  print(confusionMatrix(factor(pred_class), factor(dataset$DEATH)))
+  
+    # Identify threshold maximizing sensitivity and specificity
+  coords <- coords(roc_obj, "best", best.method = "closest.topleft")
+  best_threshold <- coords$threshold
+  
+  cat("Optimal threshold based on ROC curve:", best_threshold, "\n")
+  
+  # Predict classes based on optimal threshold
+  predicted_class <- ifelse(probs >= best_threshold, 1, 0)
+  
+  # Evaluate model performance
+  cat("Tuned Confusion Matrix:\n")
+  print(confusionMatrix(factor(predicted_class), factor(dataset$DEATH)))
+}
+
+model_comp <- function(model_list, dataset) {
+  
+  probs_list <- lapply(model_list, function(x){predict(x, type = 'response')})
+  
+  # ROC objects
+  roc_objs <- lapply(probs_list, function(x){roc(dataset$DEATH, x)
+  })
+  
+   # hyperparameter tuning
+  threshold_coords <- lapply(roc_objs, function(x){coords(x, "best", best.method = "closest.topleft")})
+  
+   # collecting metrics and thresholds
+  best_thresholds <- unlist(lapply(threshold_coords, function(x){x$threshold}))
+  auc_list <- unlist(lapply(roc_objs, auc))
+  
+  predicted_classes <- data.frame(matrix(NA, nrow = nrow(dataset), ncol =length(probs_list)))
+  
+  for (i in 1:length(probs_list)) {
+    predicted_classes[,i] <- ifelse(probs_list[[i]] >= best_thresholds[[i]], 1, 0)
+  }
+  
+  # collecting accuracies
+  acc_vec <- rep(0, length(model_list))
+  for (i in 1:length(acc_vec)) {
+    predicted_class <- ifelse(probs_list[[i]] >= best_thresholds[[i]], 1, 0)
+    acc_vec[i] <- confusionMatrix(factor(predicted_class), factor(dataset$DEATH))$overall[1]
+  }
+  
+  # collecting variable lengths
+  var_lengths <- unlist(lapply(model_list, function
+                        (x){nrow(summary(x)$coefficients)}))
+  
+  # outputting dataframe
+  return (data.frame('Model_Names'  = names(model_list),
+                     'AUCs' = auc_list,
+                     'Accuracies' = acc_vec,
+                     'Thresholds' = best_thresholds,
+                     'Number of variables' = var_lengths
+    ))
+  
+}
+
+output_confmat <- function(model, dataset){
+  # outputting the confusion matrix for the best tuned model
+  probs_ <- predict(model, newdata = dataset, type = 'response')
+  
+  # ROC objects
+  roc_ <- roc(dataset$DEATH, probs_)
+  
+  # hyperparameter tuning
+  threshold_coords_ <- coords(roc_, "best", best.method = "closest.topleft")
+  
+  # collecting metrics and thresholds
+  best_threshold_ <- threshold_coords_$threshold
+  
+  predicted_classes_ <- ifelse(probs_ >= best_threshold_, 1, 0)
+  confusionMatrix(factor(predicted_classes_), factor(dataset$DEATH))
+}
+```
+
+## Logisitic regression -  this is the base logistic regression model
+```{r}
+lr1 <- glm(DEATH ~., family = 'binomial', data = train)
+(s_full <- summary(lr1))
+```
+
+
+### Tuning logistic regression: Stepwise selection across whole dataset
+```{r}
+set.seed(123)
+# Stepwise selection
+
+model.null <- glm(DEATH ~ 1, family = 'binomial', data = train)
+step.model.forward <- step(model.null, direction = "forward", scope = list(lower = model.null, upper = lr1), trace=0)
+(s_forward <- summary(step.model.forward))
+nrow(s_forward$coefficients) 
+
+step.model.backward <- step(lr1, direction = "backward", trace=0)
+(s_backward <- summary(step.model.backward))
+nrow(s_backward$coefficients) 
+
+step.model.both <- step(lr1, direction = "both", trace=0)
+(s_both <- summary(step.model.both))
+nrow(s_both$coefficients) 
+
+nrow(s_full$coefficients) 
+```
+
+### Alternative logisitic regression model selection: LASSO
+```{r}
+set.seed(123)
+xxx <- as.matrix(train[,colnames(train)!='DEATH'])
+num_cols <- which(unlist(lapply(train[,colnames(train)!='DEATH'], class)) != 'factor')
+num_cols_idx <- unname(num_cols)
+
+xxx_centered_scaled <- xxx
+
+xxx_centered_scaled[, num_cols_idx] <- as.matrix(lapply(xxx[,num_cols_idx], function(x){x <- as.numeric(x)
+        (x - mean(x)) / sd(x)}))
+yyy <- train$DEATH
+gridd <- exp(seq(2, -10, -0.5))
+
+# choosing lambda by 10-fold cross validation and maximizing auc
+cv.lso <- cv.glmnet(xxx,yyy,family="binomial",alpha=1,lambda=gridd,nfolds=10,type.measure="auc")
+
+# plotting results
+plot(cv.lso, main ="Lasso")
+
+log(c(cv.lso$lambda.1se, cv.lso$lambda.min))
+
+coef(cv.lso,s = 'lambda.min')
+coef(cv.lso,s = 'lambda.1se')
+
+-log(gridd)
+cv.lso$cvm[which(cv.lso$lambda == cv.lso$lambda.min)]
+cv.lso$cvm[which(cv.lso$lambda == cv.lso$lambda.1se)] # this one seems more accurate # AUC: 0.798
+
+coef(cv.lso, s = 'lambda.1se')
+lso.res <- coef(cv.lso, s = 'lambda.1se')[,1]
+lso.res.vnames <- names(lso.res[lso.res!=0]) # 18 variables
+
+names(coef(step.model.both))
+step.model.both_vnames <- gsub("[0-9]", "", names(coef(step.model.both)))
+length(intersect(step.model.both_vnames, lso.res.vnames))
+
+intersect(step.model.both_vnames, lso.res.vnames)
+setdiff(step.model.both_vnames, lso.res.vnames) # PREVMI in step model
+setdiff(lso.res.vnames, step.model.both_vnames) # PREVCHD, PREVSTRK, CVDin lso model
+```
+
+
+### Comparing Models
+```{r}
+model_collection <- list(step.model.backward, step.model.forward, step.model.both, lr1)
+names(model_collection) <- c('backward', 'forward', 'both', 'full')
+
+for (i in 1:length(model_collection)){
+  print(names(model_collection)[i])
+  model_sum(model_collection[[i]], train)
+}
+
+df_comparison <- model_comp(model_collection, train)
+View(df_comparison) # the accuracies are comparable; the most parsimonious model may be better
+
+anova(step.model.both, lr1) # no significant difference in fit between the reduced models and the full model --> reduced model is adequate
+anova(step.model.forward, lr1)
+anova(step.model.backward, lr1)
+
+# result: use the step.model.both as the logistic regression model for subsequent analysis
+
+names_f <- names(coef(step.model.forward))
+names_b <- names(coef(step.model.backward))
+names_both <- names(coef(step.model.both))
+names_full <- names(coef(lr1))
+
+setdiff(names_full, names_both)
+setdiff(names_full, names_f)
+setdiff(names_full, names_b) # use step model both
+
+final_lr_fmla <- formula(step.model.both)
+final_lr_mod <- glm(final_lr_fmla, family = 'binomial', data = test)
+
+# outputting final statistics
+final_lr_list <- list(final_lr_mod)
+names(final_lr_list) <- 'Step Both'
+model_sum(final_lr_mod, dataset = test)
+model_comp(final_lr_list, dataset=test)
+
+# collecting training mismatches for training
+probs_final_lr_train <- predict(final_lr_mod, newdata=train, type = 'response')
+roc_obj_lr_train <- roc(train$DEATH, probs_final_lr_train)
+threshold_coords_lr_train <- coords(roc_obj_lr_train, "best", best.method = "closest.topleft")
+(best_threshold_lr_train <- threshold_coords_lr_train$threshold)
+(auc_lr_train <- auc(roc_obj_lr_train))
+predicted_classes_lr_train <- ifelse(probs_final_lr_train >= best_threshold_lr_train, 1, 0)
+mismatch_lr <- which(predicted_classes_lr_train != train$DEATH)
+
+# outputting the confusion matrix for the best tuned model
+probs_final_lr <- predict(final_lr_mod, newdata = test, type = 'response')
+  
+# ROC objects
+roc_obj_lr <- roc(test$DEATH, probs_final_lr)
+
+ # hyperparameter tuning
+threshold_coords_lr <- coords(roc_obj_lr, "best", best.method = "closest.topleft")
+
+ # collecting metrics and thresholds
+(best_threshold_lr <- threshold_coords_lr$threshold)
+(auc_lr <- auc(roc_obj_lr))
+
+predicted_classes_lr <- ifelse(probs_final_lr >= best_threshold_lr, 1, 0)
+confusionMatrix(factor(predicted_classes_lr), factor(test$DEATH))
+```
+
+### Logistic Regression with High SHAP Values
+```{r}
+high_shap_lr <- glm(DEATH ~ HYPERTEN + MI_FCHD + AGE + SYSBP + PREVHYP + SEX + educ  + CURSMOKE + ANGINA + CVD, family = 'binomial', data = train)
+summary(high_shap_lr)
+
+output_confmat(high_shap_lr, test)
+```
+
+### Top 5 SHAP only
+```{r}
+high_shap5_lr <- glm(DEATH ~ HYPERTEN + MI_FCHD + AGE + SYSBP + PREVHYP, family = 'binomial', data = train)
+summary(high_shap5_lr)
+
+output_confmat(high_shap5_lr, test)
+```
+
+
+## Random forests
+
+### Trying all variables
+```{r}
+library(randomForest)
+rf_full <- randomForest(DEATH~., data=train)
+rf_full_preds <- predict(rf_full, type = 'prob')
+roc_tree <- roc(train$DEATH, rf_full_preds[,2])
+(auc_tree <- auc(roc_tree)) # .7991
+
+threshold_coords_tree <- coords(roc_tree, "best", best.method = "closest.topleft")
+
+(best_threshold_tree <- threshold_coords_tree$threshold)
+
+predicted_classes_tree <- ifelse(rf_full_preds[,2] >= best_threshold_tree, 1, 0)
+confusionMatrix(factor(predicted_classes_tree), factor(train$DEATH))
+
+tree_full <- predict(rf_full, newdata=test, type = 'prob')
+roc(test$DEATH, tree_full[,2]) # 0.7899 auc
+```
+
+### Using tuneRanger: optimizes minimum node size, sample fraction, and mtry
+```{r}
+library(tuneRanger)
+fhs.task <- makeClassifTask(data = train, target = 'DEATH')
+res <- tuneRanger(fhs.task, measure = list(auc), num.trees = 100, iters = 70, save.file.path = NULL)
+res$model
+res$recommended.pars
+
+pred_tuned <- predict(res$model, newdata=test)
+pred_dats <- pred_tuned$data
+
+(roc_tune_tree <- roc(test$DEATH, pred_dats$prob.1))
+auc(roc_tune_tree) # 0.791 auc
+
+# collecting mismatches for training
+pred_trains <- predict(res$model, newdata = train)
+pred_trains_dats <- pred_trains$data
+roc_tune_tree_train <- roc(train$DEATH, pred_trains_dats$prob.1)
+threshold_coords_tree_tr <- coords(roc_tune_tree_train, "best", best.method = "closest.topleft")
+
+(best_threshold_tree_tr <- threshold_coords_tree_tr$threshold)
+
+predicted_classes_tree_tr <- ifelse(pred_trains_dats$prob.1 >= best_threshold_tree_tr, 1, 0)
+
+mismatch_tree_tr <- which(predicted_classes_tree_tr != train$DEATH)
+```
+
+
+## XGBoost - altering the learning rate with random search
+```{r}
+library(xgboost)
+set.seed(123)
+train_c <- train
+train_c$DEATH <- ifelse(train_c$DEATH==1,0,1)
+test_c <- test
+test_c$DEATH <- ifelse(test_c$DEATH==1,0,1)
+
+train_c <- train_c %>%
+  mutate(across(where(is.factor), as.numeric))
+test_c <- test_c %>%
+  mutate(across(where(is.factor), as.numeric))
+
+Dtrain <- xgb.DMatrix(
+        data = as.matrix(train_c[, colnames(train_c)!='DEATH']),
+        label = train_c$DEATH)
+Dtest <- xgb.DMatrix(
+        data = as.matrix(test_c[, colnames(test_c)!='DEATH']),
+        label = test_c$DEATH)
+
+# grid search for learning rates
+learning_rates <- seq(0.01, 0.3, by = 0.03)
+
+# creating a for loop to choose eta based on training auc
+auc_xgb <- rep(0,length(learning_rates))
+
+for (i in 1:length(learning_rates)) {
+  param_list <- list(booster = "gbtree", objective = "binary:logistic", eta=learning_rates[i], gamma=0, max_depth=6, min_child_weight=1, subsample=1, colsample_bytree=1)
+  xgb_mod <- xgb.train(params = param_list,
+                  data = Dtrain, 
+                  nrounds = 1000,
+                  early_stopping_rounds = 30,
+                  watchlist = list(val=Dtest,train=Dtrain),
+                  maximize=F)
+  xgb_pred <- predict(xgb1, Dtrain)
+  auc_xgb[i] <- auc(roc(train_c$DEATH, xgb_pred))
+}
+
+cat('The best learning rate is: ', learning_rates[which.max(auc_xgb)])
+
+max(auc_xgb) # 0.9236 auc
+
+
+xgb_best <-  xgb.train(params = list(booster = "gbtree", objective = "binary:logistic", eta=0.01, gamma=0, max_depth=6, min_child_weight=1, subsample=1, colsample_bytree=1),
+                  data = Dtrain, 
+                  nrounds = 1000,
+                  early_stopping_rounds = 30,
+                  watchlist = list(val=Dtest,train=Dtrain),
+                  maximize=F)
+xgb_pred_test <- predict(xgb_best, Dtest)
+auc(roc(test_c$DEATH, xgb_pred_test)) # 0.7784 auc
+```
+
+# Trying a simple averaging ensemble approach
+```{r}
+probs_df <- data.frame(xgbs = xgb_pred_test,
+                       tuneRF = pred_dats$prob.1,
+                       logReg = probs_final_lr)
+
+mean_probs <- apply(probs_df, 1, mean)
+roc(test$DEATH, mean_probs) # auc 0.7829
+```
+
+# Results summary on test data
+```{r}
+results_collection <- data.frame('Method' = c('Logistic Regression', 'Random Forest', 'XGBoost',  'Simple Average Ensemble'),
+                                 'Test AUC' = c(auc(roc(test$DEATH, probs_final_lr)),
+                                                auc(roc(test$DEATH, pred_dats$prob.1)),
+                                                auc(roc(test$DEATH, xgb_pred_test)),                                auc(roc(test$DEATH, mean_probs))))
+
+View(results_collection)
+```
+
+
+
+
