@@ -1,0 +1,2 @@
+Model NAame,AUC,Threshold,Accuracy,Sensitivity,Specificity
+Random Forest,0.981,0.334,0.936,0.91,0.95
